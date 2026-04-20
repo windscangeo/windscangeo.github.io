@@ -1,5 +1,18 @@
 {% extends "base.html" %}
 
+{% block announce %}
+  <div style="background: #ffcc00; padding: 12px;">
+    <strong>🚧 Note: 🚧</strong>
+    <p>This website is under construction and contents may change.</p>
+    <p>
+      Information here is related to a manuscript currently under review.
+    </p>
+    <p>
+      For the most up-to-date methodology, results, and interpretations, the final peer-reviewed publication is the authoritative source.  
+    </p>
+  </div>
+{% endblock %}
+
 {% block content %}
 {% if page.nb_url %}
     <a href="{{ page.nb_url }}" title="Download Notebook" class="md-content__button md-icon">

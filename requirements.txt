@@ -1,0 +1,11 @@
+numpy==2.5.0
+pandas==3.0.3
+fsspec==2026.6.0
+s3fs==2026.6.0
+xarray==2026.4.0
+tqdm==4.67.1        # pure-Python, no ABI constraint — anything recent works
+matplotlib==3.11.0
+h5netcdf==1.8.1
+netCDF4==1.7.4
+scikit-learn==1.9.0
+torch==2.12.1       # confirmed cp310–cp314 wheels on PyPI

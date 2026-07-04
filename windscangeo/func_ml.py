@@ -1,5 +1,4 @@
 import datetime
-import wandb
 import os
 
 import h5py
@@ -12,6 +11,361 @@ import torch.utils.data
 import cartopy.crs as ccrs
 import cartopy.feature as cfeature
 from matplotlib.colors import ListedColormap
+import sklearn.model_selection
+
+
+def get_channel_resolution_km(goes_channel):
+    """
+    Nominal nadir spatial resolution (km) for GOES-16 ABI channels.
+    Used only to derive a sensible default buffer width in `spatial_train_test_split`.
+    Note this is the *nadir* resolution: GOES ABI pixel footprints grow substantially
+    at high viewing/scan angles, so domains far from the sub-satellite point (e.g. the
+    tropical Atlantic seen from GOES-16 at 75.2 W) have a coarser true footprint than
+    this nominal value. Pass an explicit `buffer_deg` to `spatial_train_test_split` to
+    override the default if the target domain is far off-nadir.
+
+    Args:
+        goes_channel (str): GOES channel name, e.g. "C01".
+
+    Returns:
+        float: nominal resolution in km.
+    """
+    goes_channel = goes_channel.upper()
+    if goes_channel == "C02":
+        return 0.5
+    if goes_channel in ("C01", "C03", "C05"):
+        return 1.0
+    return 2.0
+
+
+def random_train_test_split(
+    images,
+    numerical_data,
+    train_fraction=0.8,
+    val_fraction=0.1,
+    random_state=42,
+):
+    """
+    Split a preloaded dataset into train/validation/test sets by randomly sampling
+    individual points, with no regard to spatial or temporal proximity. This is the
+    original split strategy used by `train_test_model` and is kept as the default,
+    mainly to compare against `spatial_train_test_split`.
+
+    Args:
+        images (np.ndarray): Array of shape (n, C, H, W).
+        numerical_data (dict): Must contain "observation_lats", "observation_lons",
+            and "observation_wind_speeds" (same format as returned by
+            `extract_matching_orbits` / stored in the preloaded .npz file).
+        train_fraction (float): Fraction of data used for training. Default 0.8.
+        val_fraction (float): Fraction *of the total* used for validation (the rest,
+            1 - train_fraction - val_fraction, becomes test). Default 0.1, which with
+            the default train_fraction gives the original 80/10/10 split.
+        random_state (int): Random seed.
+
+    Returns:
+        dict: with keys "train", "val", "test", each a dict with "images", "targets",
+            "lats", "lons".
+    """
+    lats = np.asarray(numerical_data["observation_lats"])
+    lons = np.asarray(numerical_data["observation_lons"])
+    targets = np.asarray(numerical_data["observation_wind_speeds"])
+
+    all_idx = np.arange(len(targets))
+    train_idx, rest_idx = sklearn.model_selection.train_test_split(
+        all_idx, train_size=train_fraction, random_state=random_state
+    )
+    val_idx, test_idx = sklearn.model_selection.train_test_split(
+        rest_idx,
+        train_size=val_fraction / (1 - train_fraction),
+        random_state=random_state,
+    )
+
+    def gather(idx):
+        return {
+            "images": images[idx],
+            "targets": targets[idx],
+            "lats": lats[idx],
+            "lons": lons[idx],
+        }
+
+    print(
+        f"INFO : Random split - {len(train_idx)} train / {len(val_idx)} val / "
+        f"{len(test_idx)} test"
+    )
+
+    return {"train": gather(train_idx), "val": gather(val_idx), "test": gather(test_idx)}
+
+
+def spatial_train_test_split(
+    images,
+    numerical_data,
+    test_region,
+    goes_image_size=128,
+    goes_channel="C06",
+    buffer_deg=None,
+    val_fraction=0.1,
+    random_state=42,
+):
+    """
+    Split a preloaded dataset into train/validation/test sets by holding out a
+    contiguous spatial region for testing, instead of a random per-sample split.
+
+    This directly targets the spatial-leakage concern with random splits: GOES imagery
+    has 10-minute temporal resolution and scatterometer swaths are spatially continuous,
+    so a random split places near-duplicate/neighboring samples on both sides of the
+    train/test boundary and overestimates test performance. Holding out a spatial region
+    (and excluding a buffer zone around it from training) removes that leakage.
+
+    A buffer zone around the test region is excluded from training (neither trained on
+    nor tested on) so that no training patch spatially overlaps a test patch. The default
+    buffer width is derived from the image patch footprint (`goes_image_size` pixels at
+    the channel's nominal resolution), but can be overridden directly.
+
+    Args:
+        images (np.ndarray): Array of shape (n, C, H, W).
+        numerical_data (dict): Must contain "observation_lats", "observation_lons",
+            and "observation_wind_speeds" (same format as returned by
+            `extract_matching_orbits` / stored in the preloaded .npz file).
+        test_region (dict): Bounding box to hold out, with keys
+            "lat_min", "lat_max", "lon_min", "lon_max".
+        goes_image_size (int): Patch size in pixels, used to compute the default buffer.
+        goes_channel (str): Channel used to extract the images, used to look up the
+            nominal resolution for the default buffer. Ignored if `buffer_deg` is given.
+        buffer_deg (float, optional): Width in degrees of the buffer zone excluded from
+            training around the test region. If None, computed from the patch footprint.
+        val_fraction (float): Fraction of the remaining (non-test, non-buffer) data used
+            for validation. Default 0.1.
+        random_state (int): Random seed for the train/val split of the remaining data.
+
+    Returns:
+        dict: with keys "train", "val", "test" (each a dict with "images", "targets",
+            "lats", "lons"), plus "test_region" and "buffer_deg" for reference/plotting.
+    """
+    lats = np.asarray(numerical_data["observation_lats"])
+    lons = np.asarray(numerical_data["observation_lons"])
+    targets = np.asarray(numerical_data["observation_wind_speeds"])
+
+    if buffer_deg is None:
+        resolution_km = get_channel_resolution_km(goes_channel)
+        buffer_deg = (goes_image_size * resolution_km) / 111.0
+
+    lat_min, lat_max = test_region["lat_min"], test_region["lat_max"]
+    lon_min, lon_max = test_region["lon_min"], test_region["lon_max"]
+
+    in_test = (
+        (lats >= lat_min) & (lats <= lat_max) & (lons >= lon_min) & (lons <= lon_max)
+    )
+
+    in_buffer = (
+        (lats >= lat_min - buffer_deg)
+        & (lats <= lat_max + buffer_deg)
+        & (lons >= lon_min - buffer_deg)
+        & (lons <= lon_max + buffer_deg)
+    )
+
+    test_idx = np.where(in_test)[0]
+    remaining_idx = np.where(~in_buffer)[0]
+
+    train_idx, val_idx = sklearn.model_selection.train_test_split(
+        remaining_idx, test_size=val_fraction, random_state=random_state
+    )
+
+    def gather(idx):
+        return {
+            "images": images[idx],
+            "targets": targets[idx],
+            "lats": lats[idx],
+            "lons": lons[idx],
+        }
+
+    dropped_in_buffer = int(np.sum(in_buffer) - np.sum(in_test))
+    print(
+        f"INFO : Spatial split - test region lat[{lat_min},{lat_max}] lon[{lon_min},{lon_max}], "
+        f"buffer={buffer_deg:.3f} deg"
+    )
+    print(
+        f"INFO : {len(test_idx)} test / {len(train_idx)} train / {len(val_idx)} val "
+        f"({dropped_in_buffer} points dropped in buffer zone)"
+    )
+
+    result = {"train": gather(train_idx), "val": gather(val_idx), "test": gather(test_idx)}
+    result["test_region"] = test_region
+    result["buffer_deg"] = buffer_deg
+    return result
+
+
+def prepare_data_split(saved_file_path, split_config=None):
+    """
+    Load a preloaded .npz dataset (from `extract_matching_orbits`) and split it into
+    train/validation/test sets, without building PyTorch datasets or starting training.
+
+    Meant to run in its own notebook cell, ahead of `train_test_model`, so the split can
+    be inspected and plotted (e.g. with `plot_data_split_map`) before spending time on
+    training. Pass the returned dict straight to `train_test_model`.
+
+    Args:
+        saved_file_path (str): Path to a .npz file produced by `extract_matching_orbits`.
+        split_config (dict, optional): Defaults to a random 80/10/10 split. Pass
+            {"strategy": "random", "train_fraction": 0.8, "val_fraction": 0.1,
+            "random_state": 42} to override the random split, or
+            {"strategy": "spatial", "test_region": {...}, "goes_channel": ...,
+            "buffer_deg": None, "val_fraction": 0.1, "random_state": 42} to hold out a
+            spatial region instead (see `spatial_train_test_split`).
+
+    Returns:
+        dict: with keys "train", "val", "test" (each a dict with "images", "targets",
+            "lats", "lons"), plus "strategy" and, for spatial splits, "test_region" and
+            "buffer_deg".
+    """
+    data_file = np.load(saved_file_path, allow_pickle=True)
+    images = np.array(data_file["images"])
+    numerical_data = data_file["numerical_data"].item()
+
+    print("INFO : Data loaded from file:", saved_file_path)
+
+    if split_config is None:
+        split_config = {"strategy": "random"}
+
+    if split_config["strategy"] == "spatial":
+        data_split = spatial_train_test_split(
+            images,
+            numerical_data,
+            test_region=split_config["test_region"],
+            goes_image_size=split_config.get("goes_image_size", 128),
+            goes_channel=split_config.get("goes_channel", "C06"),
+            buffer_deg=split_config.get("buffer_deg"),
+            val_fraction=split_config.get("val_fraction", 0.1),
+            random_state=split_config.get("random_state", 42),
+        )
+    else:
+        data_split = random_train_test_split(
+            images,
+            numerical_data,
+            train_fraction=split_config.get("train_fraction", 0.8),
+            val_fraction=split_config.get("val_fraction", 0.1),
+            random_state=split_config.get("random_state", 42),
+        )
+
+    data_split["strategy"] = split_config["strategy"]
+    return data_split
+
+
+def plot_data_split_map(
+    data_split,
+    extent=None,
+    max_points_per_split=5000,
+    path_folder=None,
+    random_state=42,
+):
+    """
+    Lightweight map of the train/validation/test split produced by `prepare_data_split`,
+    to visually verify the split - especially a spatial holdout and its buffer - before
+    launching training.
+
+    Stays cheap for the ~50k points typical of a single day of collocations: coastlines
+    are drawn at coarse (110m) resolution, there is no gridded background, and each group
+    is randomly subsampled to `max_points_per_split` points purely for plotting speed (the
+    split used for training is unaffected).
+
+    Args:
+        data_split (dict): Output of `prepare_data_split` (or `random_train_test_split` /
+            `spatial_train_test_split` directly).
+        extent (tuple, optional): (lon_min, lon_max, lat_min, lat_max) for the map. If
+            None, computed from the data with a small margin.
+        max_points_per_split (int): Max number of points plotted per train/val/test group.
+        path_folder (str, optional): If given, saves the figure to
+            `{path_folder}/data_split_map.png`.
+        random_state (int): Seed for the plotting subsample only.
+
+    Returns:
+        matplotlib.figure.Figure
+    """
+    rng = np.random.default_rng(random_state)
+
+    def subsample(group):
+        n = len(group["lats"])
+        if n <= max_points_per_split:
+            return group["lats"], group["lons"]
+        idx = rng.choice(n, size=max_points_per_split, replace=False)
+        return group["lats"][idx], group["lons"][idx]
+
+    colors = {"train": "tab:blue", "val": "tab:orange", "test": "tab:red"}
+    coords = {name: subsample(data_split[name]) for name in ("train", "val", "test")}
+
+    if extent is None:
+        all_lats = np.concatenate([data_split[n]["lats"] for n in ("train", "val", "test")])
+        all_lons = np.concatenate([data_split[n]["lons"] for n in ("train", "val", "test")])
+        margin = 2.0
+        extent = (
+            all_lons.min() - margin,
+            all_lons.max() + margin,
+            all_lats.min() - margin,
+            all_lats.max() + margin,
+        )
+
+    fig = plt.figure(figsize=(12, 6))
+    ax = plt.axes(projection=ccrs.PlateCarree())
+    ax.set_extent(extent, crs=ccrs.PlateCarree())
+    # explicit 110m (coarsest) resolution to keep this cheap - cfeature.LAND defaults to 50m
+    land_110m = cfeature.NaturalEarthFeature(
+        "physical", "land", "110m", edgecolor="none", facecolor="lightgray"
+    )
+    ax.add_feature(land_110m, zorder=2)
+    ax.coastlines(resolution="110m", zorder=3)
+
+    for name in ("train", "val", "test"):
+        lats, lons = coords[name]
+        n_total = len(data_split[name]["lats"])
+        ax.scatter(
+            lons,
+            lats,
+            s=3,
+            color=colors[name],
+            alpha=0.5,
+            zorder=4,
+            transform=ccrs.PlateCarree(),
+            label=f"{name} (n={n_total})",
+        )
+
+    # For a spatial holdout, draw the raw test box and the buffered exclusion zone
+    if "test_region" in data_split:
+        region = data_split["test_region"]
+        buffer_deg = data_split["buffer_deg"]
+
+        def draw_box(lat_min, lat_max, lon_min, lon_max, **kwargs):
+            ax.plot(
+                [lon_min, lon_max, lon_max, lon_min, lon_min],
+                [lat_min, lat_min, lat_max, lat_max, lat_min],
+                transform=ccrs.PlateCarree(),
+                zorder=5,
+                **kwargs,
+            )
+
+        draw_box(
+            region["lat_min"], region["lat_max"], region["lon_min"], region["lon_max"],
+            color="black", linewidth=1.5, linestyle="-", label="test region",
+        )
+        draw_box(
+            region["lat_min"] - buffer_deg, region["lat_max"] + buffer_deg,
+            region["lon_min"] - buffer_deg, region["lon_max"] + buffer_deg,
+            color="black", linewidth=1, linestyle="--", label=f"buffer ({buffer_deg:.2f} deg)",
+        )
+
+    gl = ax.gridlines(draw_labels=True, linestyle="--", alpha=0.3)
+    gl.top_labels = False
+    gl.right_labels = False
+
+    ax.set_title(f"Data split ({data_split.get('strategy', 'random')})")
+    ax.legend(loc="upper right", markerscale=3, fontsize=8)
+
+    if path_folder:
+        if not os.path.exists(path_folder):
+            os.makedirs(path_folder)
+        fig.savefig(
+            os.path.join(path_folder, "data_split_map.png"), dpi=300, bbox_inches="tight"
+        )
+
+    return fig
 
 def vectorized_solar_angles(lat, lon, time_utc):
 

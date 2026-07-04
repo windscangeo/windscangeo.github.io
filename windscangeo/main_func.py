@@ -66,9 +66,9 @@ def extract_matching_orbits(scatterometer_data_path: str,
     # If this is first run with dataset, it will create a folder with indices which takes time.
     
     images = extract_goes(  
-        observation_times=valid_times[0:100], #TODO: REMOVE THIS LIMITATION, only for debugging
-        observation_lats=valid_lats[0:100],
-        observation_lons=valid_lons[0:100],
+        observation_times=valid_times, 
+        observation_lats=valid_lats,
+        observation_lons=valid_lons,
         scatterometer_data_path=scatterometer_data_path,
         goes_aws_url_folder=goes_aws_url_folder,
         goes_channel=goes_channel,
@@ -117,36 +117,43 @@ def extract_matching_orbits(scatterometer_data_path: str,
 
 
 def train_test_model(
-    saved_file_path: str,
+    data_split: dict,
     run_name: str,
     model_parameters: dict,
     normalization_factors: dict,
     ):
 
     """
-    Trains and tests a model using the provided parameters and data from a saved file (from `extract_matching_orbits`).
+    Trains and tests a model using the provided parameters and an already-split dataset.
+
+    Data preparation is a separate step from training: build `data_split` with
+    `prepare_data_split(saved_file_path, split_config)` in its own cell first (optionally
+    inspecting it with `plot_data_split_map`), then pass the result here. This makes it
+    possible to verify a spatial holdout (or any split) before spending time on training.
 
     Args:
-        saved_file_path (str): Path to the saved .npz file containing preloaded data.
+        data_split (dict): Output of `prepare_data_split` (or `random_train_test_split` /
+            `spatial_train_test_split` directly), with keys "train", "val", "test", each
+            a dict containing "images" and "targets".
         run_name (str): Name of the run, used to create a folder for saving results.
         model_parameters (dict): Dictionary containing model parameters such as batch size, image size, learning rate, etc (Supports CNN, ResNet, ViT). See tutorial for details.
         normalization_factors (dict): Dictionary containing normalization factors (mean and std) for the images dataset.
 
     Returns:
-        result_path_folder (str): Path to the folder where results are saved.  
-        
-    
+        result_path_folder (str): Path to the folder where results are saved.
+
+
     model_parameters should contain the following (dictionary, values can be changed as needed):
             "batch_size" : 256,
-            "image_size": 128, 
-            "image_channels" : 1,  
+            "image_size": 128,
+            "image_channels" : 1,
             "model_choice" : "ResNet", # or "CNN" or"ViT"
             "criterion" : nn.MSELoss(), # or any other PyTorch loss function
-            "optimizer_choice" : "Adam", 
+            "optimizer_choice" : "Adam",
             "learning_rate" : 0.003305753102490767,
             "weight_decay" : 0.00000148842072509874,
             "dropout_rate" : 0.2752124679248082,
-            "num_epochs" : 10, 
+            "num_epochs" : 10,
             "patience_epochs" : 20, # early stopping
             "patience_loss" : 0.001,
 
@@ -186,9 +193,22 @@ def train_test_model(
     patience_loss = model_parameters["patience_loss"]
     model_choice = model_parameters["model_choice"]
 
-    # specify the device
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"INFO : Pytorch is using device: {device}")
+
+    # for mac devices 
+
+    if torch.backends.mps.is_available():
+        device = torch.device("mps")
+        print("using Apple M-series gpu")
+    if not torch.backends.mps.is_available():
+        if not torch.backends.mps.is_built():
+            print("MPS not available because the current PyTorch install was not built with MPS enabled.")
+        else:
+            print("MPS not available because the current MacOS version is not 12.3+ and/or you do not have an MPS-enabled device on this machine.")
+
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        print(f"INFO : Pytorch is using device: {device}")
+    
+    
 
     # Load the model
 
@@ -242,33 +262,32 @@ def train_test_model(
     mean = normalization_factors["mean"]
     std = normalization_factors["std"]
 
-    data_file = np.load(saved_file_path,allow_pickle=True)
-    data_file_images = np.array(data_file['images'])
-    data_file_numerical_data = data_file['numerical_data'].item()['observation_wind_speeds']
+    print(
+        f"INFO : Using pre-split data ({data_split.get('strategy', 'unknown')} strategy) - "
+        f"{len(data_split['train']['targets'])} train / {len(data_split['val']['targets'])} val / "
+        f"{len(data_split['test']['targets'])} test"
+    )
 
-    print("INFO : Data loaded from file:", saved_file_path)
-    
-    train_images, rest_images, train_targets, rest_targets = sklearn.model_selection.train_test_split(data_file_images,data_file_numerical_data,train_size = 0.8,random_state=42)
-    val_images, test_images, val_targets, test_targets = sklearn.model_selection.train_test_split(rest_images,rest_targets,train_size = 0.5,random_state=42)
-    print("INFO : Data split into train (0.8), validation (0.1) and test sets (0.1)")
-    # loading the data 
-
+    # save test point locations alongside results, useful to verify/plot the held-out region later
+    if "lats" in data_split["test"]:
+        np.save(os.path.join(result_path_folder, "test_lats.npy"), data_split["test"]["lats"])
+        np.save(os.path.join(result_path_folder, "test_lons.npy"), data_split["test"]["lons"])
 
     train_dataset = conventional_dataset(
-        train_images,
-        train_targets,
+        data_split["train"]["images"],
+        data_split["train"]["targets"],
         #transform=Normalize(mean,std),
     )
 
     validation_dataset = conventional_dataset(
-        val_images,
-        val_targets,
+        data_split["val"]["images"],
+        data_split["val"]["targets"],
         #transform=Normalize(mean,std),
     )
 
     test_dataset = conventional_dataset(
-        test_images,
-        test_targets,
+        data_split["test"]["images"],
+        data_split["test"]["targets"],
         #transform=Normalize(mean,std),
     )
 

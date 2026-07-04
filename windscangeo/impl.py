@@ -6,7 +6,6 @@ import torch
 import torch.optim.lr_scheduler as lr_scheduler
 from torch import nn, optim
 from tqdm import tqdm
-import wandb
 import time
 
 def early_stopping(valid_losses, patience_epochs, patience_loss):  # From @Jing
